@@ -1,5 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+export async function GET() {
+  return NextResponse.json({ 
+    status: 'PGN Analysis API is running. Send a POST request with a PGN body.',
+    usage: 'POST to this URL with { "pgn": "your-pgn-string" }'
+  });
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
