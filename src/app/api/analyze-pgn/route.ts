@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-// Force dynamic to ensure this runs as a serverless function
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
@@ -22,83 +21,104 @@ export async function POST(request: NextRequest) {
     // Import Chess.js for PGN parsing
     const { Chess } = await import('chess.js');
     const game = new Chess();
-    
-    // Load the PGN
     game.loadPgn(pgn);
     const moves = game.history();
-    const moveCount = moves.length;
+    const fens = game.history({ verbose: true }).map(m => m.after);
+    fens.unshift(game.header().FEN || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1');
+    const uciMoves = game.history({ verbose: true }).map(m => m.from + m.to);
+
+    // Import Chesskit's analysis functions
+    const { getMovesClassification } = await import('@/lib/engine/helpers/moveClassification');
+    const { computeAccuracy } = await import('@/lib/engine/helpers/accuracy');
+    const { getPositionWinPercentage } = await import('@/lib/engine/helpers/winPercentage');
+    const { computeEstimatedElo } = await import('@/lib/engine/helpers/estimateElo');
+
+    // Analyze each position
+    const rawPositions: any[] = [];
     
-    // Get game metadata
+    for (let i = 0; i <= moves.length; i++) {
+      const fen = fens[i];
+      const tempGame = new Chess(fen);
+      
+      const lines = [{
+        pv: i < moves.length ? [moves[i]] : [],
+        cp: evaluatePositionSimple(tempGame),
+        depth: 10,
+        multiPv: 1
+      }];
+      
+      rawPositions.push({
+        lines,
+        fen: fen
+      });
+    }
+
+    // Classify moves using Chesskit's real logic
+    const classifiedPositions = getMovesClassification(rawPositions, uciMoves, fens);
+    
+    // Compute accuracy
+    const accuracy = computeAccuracy(classifiedPositions);
+    
+    // Estimate ELO
+    const estimatedElo = computeEstimatedElo(classifiedPositions);
+    
+    // Build move classifications summary
+    const moveClassifications = classifiedPositions.slice(1).map((pos: any, index: number) => ({
+      moveNumber: index + 1,
+      san: moves[index],
+      uci: uciMoves[index],
+      classification: pos.moveClassification,
+      classificationLabel: getClassificationLabel(pos.moveClassification),
+      winPercentage: getPositionWinPercentage(pos),
+      opening: pos.opening || null
+    }));
+
+    // Count classifications
+    const classificationCounts: Record<string, number> = {
+      Splendid: 0,
+      Perfect: 0,
+      Best: 0,
+      Excellent: 0,
+      Okay: 0,
+      Opening: 0,
+      Forced: 0,
+      Inaccuracy: 0,
+      Mistake: 0,
+      Blunder: 0,
+    };
+
+    for (const m of moveClassifications) {
+      const key = String(m.classification);
+      if (key in classificationCounts) {
+        classificationCounts[key]++;
+      }
+    }
+
+    // Get player names
     const header = game.header();
-    
-    // Analyze each move with Stockfish (simplified - full analysis requires engine)
-    // For now, return move classifications based on basic heuristics
-    const analyzedMoves = moves.map((move, index) => {
-      // Basic classification based on move characteristics
-      let classification = 'Good';
-      
-      // Check for captures (simplified)
-      if (move.includes('x')) {
-        classification = 'Great';
-      }
-      
-      // Check for checks
-      if (move.includes('+')) {
-        classification = 'Great';
-      }
-      
-      // Check for checkmate
-      if (move.includes('#')) {
-        classification = 'Brilliant';
-      }
-      
-      // Check for obvious blunders (very simplified)
-      if (move.includes('??')) {
-        classification = 'Blunder';
-      }
-      
-      return {
-        moveNumber: index + 1,
-        san: move,
-        classification: classification,
-        fen: game.fen() // FEN after this move
-      };
-    });
-
-    // Calculate basic statistics
-    const classifications = {
-      Brilliant: analyzedMoves.filter(m => m.classification === 'Brilliant').length,
-      Great: analyzedMoves.filter(m => m.classification === 'Great').length,
-      Good: analyzedMoves.filter(m => m.classification === 'Good').length,
-      Mistake: analyzedMoves.filter(m => m.classification === 'Mistake').length,
-      Blunder: analyzedMoves.filter(m => m.classification === 'Blunder').length,
-    };
-
-    // Estimate accuracy (simplified)
-    const accuracy = {
-      white: Math.min(100, 85 + (classifications.Brilliant * 2) + classifications.Great - (classifications.Blunder * 3)),
-      black: Math.min(100, 85 + (classifications.Brilliant * 2) + classifications.Great - (classifications.Blunder * 3)),
-    };
 
     return NextResponse.json({
       success: true,
       review: {
         gameInfo: {
-          event: header.Event || 'Unknown',
-          site: header.Site || 'Unknown',
-          date: header.Date || 'Unknown',
           white: header.White || 'Unknown',
           black: header.Black || 'Unknown',
           result: header.Result || '*',
+          event: header.Event || 'Unknown',
+          date: header.Date || 'Unknown',
           eco: header.ECO || 'Unknown',
+          totalMoves: moves.length,
         },
-        statistics: {
-          totalMoves: moveCount,
-          classifications: classifications,
-          accuracy: accuracy,
+        accuracy: {
+          white: Math.round(accuracy.white),
+          black: Math.round(accuracy.black),
         },
-        moves: analyzedMoves,
-        pgn: pgn,
+        estimatedElo: estimatedElo ? {
+          white: Math.round(estimatedElo.white),
+          black: Math.round(estimatedElo.black),
+        } : null,
+        classifications: classificationCounts,
+        moves: moveClassifications,
       }
     });
 
@@ -109,4 +129,45 @@ export async function POST(request: NextRequest) {
       details: error instanceof Error ? error.message : 'Unknown error' 
     }, { status: 500 });
   }
+}
+
+function evaluatePositionSimple(game: any): number {
+  const pieceValues: Record<string, number> = {
+    p: 100, n: 320, b: 330, r: 500, q: 900, k: 20000
+  };
+  
+  let evaluation = 0;
+  const board = game.board();
+  
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const piece = board[row][col];
+      if (piece) {
+        const value = pieceValues[piece.type];
+        const multiplier = piece.color === 'w' ? 1 : -1;
+        evaluation += value * multiplier;
+        
+        const centerDist = Math.abs(3.5 - row) + Math.abs(3.5 - col);
+        evaluation += Math.max(0, 10 - centerDist * 2) * multiplier;
+      }
+    }
+  }
+  
+  return evaluation;
+}
+
+function getClassificationLabel(classification: string): string {
+  const labels: Record<string, string> = {
+    Splendid: 'Brilliant',
+    Perfect: 'Great',
+    Best: 'Best',
+    Excellent: 'Excellent',
+    Okay: 'Okay',
+    Opening: 'Opening',
+    Forced: 'Forced',
+    Inaccuracy: 'Inaccuracy',
+    Mistake: 'Mistake',
+    Blunder: 'Blunder',
+  };
+  return labels[classification] || classification;
 }
