@@ -2,9 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
+// In-memory cache
+const cache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
 export async function GET() {
   return NextResponse.json({ 
-    status: 'Live Analysis API. Send POST with FEN.'
+    status: 'Live Analysis API with cache.',
+    cacheSize: cache.size
   });
 }
 
@@ -17,12 +22,23 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'FEN string is required' }, { status: 400 });
     }
 
+    // Normalize FEN (remove move counters)
+    const normalizedFen = fen.split(' ').slice(0, 4).join(' ');
+    
+    // Check cache
+    const cached = cache.get(normalizedFen);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      return NextResponse.json({ ...cached.data, cached: true });
+    }
+
     const { Chess } = await import('chess.js');
     const game = new Chess(fen);
     const moves = game.moves({ verbose: true });
 
     if (moves.length === 0) {
-      return NextResponse.json({ success: true, gameOver: true });
+      const result = { success: true, gameOver: true };
+      cache.set(normalizedFen, { data: result, timestamp: Date.now() });
+      return NextResponse.json(result);
     }
 
     const pieceValues: Record<string, number> = {
@@ -31,19 +47,33 @@ export async function POST(request: NextRequest) {
 
     const evaluatedMoves = moves.map(move => {
       game.move(move);
-      let evalScore = 0;
-      const board = game.board();
-      for (let row = 0; row < 8; row++) {
-        for (let col = 0; col < 8; col++) {
-          const piece = board[row][col];
-          if (piece) {
-            const value = pieceValues[piece.type] || 0;
-            evalScore += piece.color === 'w' ? value : -value;
+      
+      let opponentBestScore = -Infinity;
+      const opponentMoves = game.moves({ verbose: true });
+      
+      for (const oppMove of opponentMoves) {
+        game.move(oppMove);
+        let score = 0;
+        const board = game.board();
+        for (let row = 0; row < 8; row++) {
+          for (let col = 0; col < 8; col++) {
+            const piece = board[row][col];
+            if (piece) {
+              const value = pieceValues[piece.type] || 0;
+              score += piece.color === 'w' ? value : -value;
+            }
           }
         }
+        game.undo();
+        if (score > opponentBestScore) opponentBestScore = score;
       }
+      
       game.undo();
-      return { ...move, evaluation: evalScore };
+      
+      const turn = game.turn();
+      const adjustedScore = turn === 'w' ? opponentBestScore : -opponentBestScore;
+      
+      return { ...move, evaluation: adjustedScore };
     });
 
     const turn = game.turn();
@@ -51,7 +81,7 @@ export async function POST(request: NextRequest) {
 
     const bestMove = evaluatedMoves[0];
 
-    return NextResponse.json({
+    const result = {
       success: true,
       bestMove: {
         from: bestMove.from,
@@ -63,7 +93,22 @@ export async function POST(request: NextRequest) {
         from: m.from, to: m.to, san: m.san, evaluation: m.evaluation
       })),
       gameOver: false
-    });
+    };
+
+    // Store in cache
+    cache.set(normalizedFen, { data: result, timestamp: Date.now() });
+    
+    // Clean old cache entries periodically
+    if (cache.size > 1000) {
+      const now = Date.now();
+      for (const [key, value] of cache) {
+        if (now - value.timestamp > CACHE_TTL) {
+          cache.delete(key);
+        }
+      }
+    }
+
+    return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json({ error: 'Analysis failed' }, { status: 500 });
   }
