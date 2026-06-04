@@ -2,13 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
-// In-memory cache
 const cache = new Map<string, { data: any; timestamp: number }>();
-const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const CACHE_TTL = 60 * 60 * 1000;
 
 export async function GET() {
   return NextResponse.json({ 
-    status: 'Live Analysis API with cache.',
+    status: 'Live Analysis API - Multi-depth',
     cacheSize: cache.size
   });
 }
@@ -16,16 +15,16 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { fen } = body;
+    const { fen, depth } = body;  // depth parameter from client
 
     if (!fen || typeof fen !== 'string') {
       return NextResponse.json({ error: 'FEN string is required' }, { status: 400 });
     }
 
-    // Normalize FEN (remove move counters)
-    const normalizedFen = fen.split(' ').slice(0, 4).join(' ');
+    const requestedDepth = depth || 3; // Default 3-ply
+
+    const normalizedFen = fen.split(' ').slice(0, 4).join(' ') + '_d' + requestedDepth;
     
-    // Check cache
     const cached = cache.get(normalizedFen);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
       return NextResponse.json({ ...cached.data, cached: true });
@@ -45,68 +44,87 @@ export async function POST(request: NextRequest) {
       p: 100, n: 320, b: 330, r: 500, q: 900, k: 20000
     };
 
-    const evaluatedMoves = moves.map(move => {
-      game.move(move);
-      
-      let opponentBestScore = -Infinity;
-      const opponentMoves = game.moves({ verbose: true });
-      
-      for (const oppMove of opponentMoves) {
-        game.move(oppMove);
-        let score = 0;
-        const board = game.board();
-        for (let row = 0; row < 8; row++) {
-          for (let col = 0; col < 8; col++) {
-            const piece = board[row][col];
-            if (piece) {
-              const value = pieceValues[piece.type] || 0;
-              score += piece.color === 'w' ? value : -value;
-            }
+    function evaluateBoard(g: any): number {
+      let score = 0;
+      const board = g.board();
+      for (let row = 0; row < 8; row++) {
+        for (let col = 0; col < 8; col++) {
+          const piece = board[row][col];
+          if (piece) {
+            const value = pieceValues[piece.type] || 0;
+            score += piece.color === 'w' ? value : -value;
           }
         }
-        game.undo();
-        if (score > opponentBestScore) opponentBestScore = score;
       }
-      
+      return score;
+    }
+
+    function alphaBeta(g: any, d: number, alpha: number, beta: number, isMax: boolean): number {
+      if (d === 0 || g.isGameOver()) {
+        if (g.isCheckmate()) return isMax ? -99999 + (requestedDepth - d) : 99999 - (requestedDepth - d);
+        if (g.isDraw()) return 0;
+        return evaluateBoard(g);
+      }
+
+      const legalMoves = g.moves({ verbose: true });
+      legalMoves.sort((a: any, b: any) => {
+        if (a.flags?.includes('c') && !b.flags?.includes('c')) return -1;
+        if (!a.flags?.includes('c') && b.flags?.includes('c')) return 1;
+        return 0;
+      });
+
+      if (isMax) {
+        let maxEval = -Infinity;
+        for (const move of legalMoves) {
+          g.move(move);
+          maxEval = Math.max(maxEval, alphaBeta(g, d - 1, alpha, beta, false));
+          g.undo();
+          alpha = Math.max(alpha, maxEval);
+          if (beta <= alpha) break;
+        }
+        return maxEval;
+      } else {
+        let minEval = Infinity;
+        for (const move of legalMoves) {
+          g.move(move);
+          minEval = Math.min(minEval, alphaBeta(g, d - 1, alpha, beta, true));
+          g.undo();
+          beta = Math.min(beta, minEval);
+          if (beta <= alpha) break;
+        }
+        return minEval;
+      }
+    }
+
+    const isMax = game.turn() === 'w';
+    let bestMove = moves[0];
+    let bestScore = isMax ? -Infinity : Infinity;
+
+    for (const move of moves) {
+      game.move(move);
+      const score = alphaBeta(game, requestedDepth - 1, -Infinity, Infinity, !isMax);
       game.undo();
       
-      const turn = game.turn();
-      const adjustedScore = turn === 'w' ? opponentBestScore : -opponentBestScore;
-      
-      return { ...move, evaluation: adjustedScore };
-    });
-
-    const turn = game.turn();
-    evaluatedMoves.sort((a, b) => turn === 'w' ? b.evaluation - a.evaluation : a.evaluation - b.evaluation);
-
-    const bestMove = evaluatedMoves[0];
+      if (isMax) {
+        if (score > bestScore) { bestScore = score; bestMove = move; }
+      } else {
+        if (score < bestScore) { bestScore = score; bestMove = move; }
+      }
+    }
 
     const result = {
       success: true,
+      depth: requestedDepth,
       bestMove: {
         from: bestMove.from,
         to: bestMove.to,
         san: bestMove.san,
-        evaluation: bestMove.evaluation
+        evaluation: bestScore
       },
-      topLines: evaluatedMoves.slice(0, 3).map(m => ({
-        from: m.from, to: m.to, san: m.san, evaluation: m.evaluation
-      })),
       gameOver: false
     };
 
-    // Store in cache
     cache.set(normalizedFen, { data: result, timestamp: Date.now() });
-    
-    // Clean old cache entries periodically
-    if (cache.size > 1000) {
-      const now = Date.now();
-      for (const [key, value] of cache) {
-        if (now - value.timestamp > CACHE_TTL) {
-          cache.delete(key);
-        }
-      }
-    }
 
     return NextResponse.json(result);
   } catch (error) {
